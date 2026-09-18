@@ -9,6 +9,8 @@ on:
 env:
   OBS_VERSION: '30.2.3'
   ORT_VERSION: '1.18.0'
+  DML_VERSION: '1.14.1'
+  DEPS_DATE: '2024-03-19'
 
 jobs:
   build:
@@ -20,19 +22,42 @@ jobs:
         with:
           path: plugin
 
-      # ------------------------------------------------------------------
-      # libobs
-      #
-      # We build only the libobs target from the OBS source tree. The UI,
-      # bundled plugins and scripting are all switched off, which takes this
-      # from ~40 minutes down to ~12.
-      # ------------------------------------------------------------------
+      - name: Cache OBS dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: obs-deps
+          key: obs-deps-${{ env.DEPS_DATE }}-x64
+
+      - name: Fetch OBS prebuilt dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/obsproject/obs-deps/releases/download/${{ env.DEPS_DATE }}/windows-deps-${{ env.DEPS_DATE }}-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile deps.zip
+          Expand-Archive deps.zip -DestinationPath deps-raw
+          $root = "deps-raw"
+          $kids = Get-ChildItem $root
+          if ($kids.Count -eq 1 -and $kids[0].PSIsContainer) {
+            $root = $kids[0].FullName
+          }
+          Move-Item $root "$env:GITHUB_WORKSPACE/obs-deps"
+
+      - name: Show dependency layout
+        shell: pwsh
+        run: |
+          Write-Host "--- obs-deps ---"
+          Get-ChildItem obs-deps | Select-Object -ExpandProperty Name
+          Write-Host "--- cmake configs found ---"
+          Get-ChildItem obs-deps -Recurse -Filter "*onfig.cmake" |
+            Select-Object -ExpandProperty FullName
+
       - name: Cache libobs build
         id: cache-obs
         uses: actions/cache@v4
         with:
           path: obs-studio/build
-          key: libobs-${{ env.OBS_VERSION }}-windows-x64-v2
+          key: libobs-${{ env.OBS_VERSION }}-${{ env.DEPS_DATE }}-x64-v3
 
       - name: Check out OBS Studio
         if: steps.cache-obs.outputs.cache-hit != 'true'
@@ -42,14 +67,6 @@ jobs:
           ref: ${{ env.OBS_VERSION }}
           submodules: recursive
           path: obs-studio
-
-      - name: Fetch OBS prebuilt dependencies
-        if: steps.cache-obs.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $url = "https://github.com/obsproject/obs-deps/releases/download/2024-03-19/windows-deps-2024-03-19-x64.zip"
-          Invoke-WebRequest -Uri $url -OutFile deps.zip
-          Expand-Archive deps.zip -DestinationPath "$env:GITHUB_WORKSPACE/obs-deps"
 
       - name: Build libobs
         if: steps.cache-obs.outputs.cache-hit != 'true'
@@ -65,25 +82,25 @@ jobs:
             -DBUILD_TESTS=OFF
           cmake --build obs-studio/build --config Release --target libobs
 
-      # ------------------------------------------------------------------
-      # ONNX Runtime (DirectML build, for GPU inference)
-      # ------------------------------------------------------------------
       - name: Fetch ONNX Runtime
         shell: pwsh
         run: |
-            $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/${{ env.ORT_VERSION }}"
-            Invoke-WebRequest -Uri $url -OutFile ort.zip
-            Expand-Archive ort.zip -DestinationPath ort-nuget
-            New-Item -ItemType Directory -Force -Path onnxruntime/include, onnxruntime/lib | Out-Null
-            Copy-Item "ort-nuget/build/native/include/*" "onnxruntime/include/" -Recurse -Force
-            Copy-Item "ort-nuget/runtimes/win-x64/native/*" "onnxruntime/lib/" -Force
+          $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/${{ env.ORT_VERSION }}"
+          Invoke-WebRequest -Uri $url -OutFile ort.zip
+          Expand-Archive ort.zip -DestinationPath ort-nuget
+          New-Item -ItemType Directory -Force -Path onnxruntime/include, onnxruntime/lib | Out-Null
+          Copy-Item "ort-nuget/build/native/include/*" "onnxruntime/include/" -Recurse -Force
+          Copy-Item "ort-nuget/runtimes/win-x64/native/*" "onnxruntime/lib/" -Force
 
-      # ------------------------------------------------------------------
-      # The depth model itself.
-      #
-      # ~100 MB. Bundling it means the user never has to hunt for a file,
-      # which is the single biggest usability win over the manual route.
-      # ------------------------------------------------------------------
+      - name: Fetch DirectML runtime
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $url = "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/${{ env.DML_VERSION }}"
+          Invoke-WebRequest -Uri $url -OutFile dml.zip
+          Expand-Archive dml.zip -DestinationPath dml-nuget
+          Copy-Item "dml-nuget/bin/x64-win/DirectML.dll" "onnxruntime/lib/" -Force
+
       - name: Fetch depth model
         shell: pwsh
         run: |
@@ -91,9 +108,6 @@ jobs:
           $url = "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx"
           Invoke-WebRequest -Uri $url -OutFile "models/depth_anything_v2_small.onnx"
 
-      # ------------------------------------------------------------------
-      # The plugin
-      # ------------------------------------------------------------------
       - name: Configure plugin
         shell: pwsh
         run: |
@@ -105,9 +119,6 @@ jobs:
       - name: Build plugin
         run: cmake --build plugin/build --config Release
 
-      # ------------------------------------------------------------------
-      # Stage everything the installer needs in one predictable folder
-      # ------------------------------------------------------------------
       - name: Stage payload
         shell: pwsh
         run: |
@@ -115,7 +126,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stage/bin" | Out-Null
           New-Item -ItemType Directory -Force -Path "$stage/data" | Out-Null
           New-Item -ItemType Directory -Force -Path "$stage/models" | Out-Null
-
           Copy-Item "plugin/build/Release/obs-depth-bokeh.dll" "$stage/bin/"
           Copy-Item "onnxruntime/lib/onnxruntime.dll" "$stage/bin/"
           if (Test-Path "onnxruntime/lib/DirectML.dll") {
@@ -139,8 +149,6 @@ jobs:
           name: obs-depth-bokeh-installer
           path: dist/*.exe
 
-      # Tag a commit as v1.0.0 and the installer lands on the Releases page
-      # automatically, ready to hand to anyone.
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
