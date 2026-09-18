@@ -52,21 +52,23 @@ jobs:
           Get-ChildItem obs-deps -Recurse -Filter "*onfig.cmake" |
             Select-Object -ExpandProperty FullName
 
-      - name: Cache libobs build
-        id: cache-obs
-        uses: actions/cache@v4
-        with:
-          path: obs-studio/build
-          key: libobs-${{ env.OBS_VERSION }}-${{ env.DEPS_DATE }}-x64-v3
-
+      # Source first, cache second. The exported libobs config points at the
+      # source tree for its headers, so restoring only the build folder
+      # leaves CMake chasing a path that was never checked out.
       - name: Check out OBS Studio
-        if: steps.cache-obs.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
         with:
           repository: obsproject/obs-studio
           ref: ${{ env.OBS_VERSION }}
           submodules: recursive
           path: obs-studio
+
+      - name: Cache libobs build
+        id: cache-obs
+        uses: actions/cache@v4
+        with:
+          path: obs-studio/build
+          key: libobs-${{ env.OBS_VERSION }}-${{ env.DEPS_DATE }}-x64-v3
 
       - name: Build libobs
         if: steps.cache-obs.outputs.cache-hit != 'true'
