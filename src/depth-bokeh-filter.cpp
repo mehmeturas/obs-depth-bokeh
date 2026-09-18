@@ -335,10 +335,7 @@ static void capture_for_inference(depth_bokeh_filter *f, obs_source_t *target,
 	vec4_zero(&clear);
 	gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
 	gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
-	gs_matrix_push();
-	gs_matrix_scale3f((float)cw / (float)w, (float)ch / (float)h, 1.0f);
 	obs_source_video_render(target);
-	gs_matrix_pop();
 	gs_texrender_end(f->capture);
 
 	gs_stage_texture(f->stage, gs_texrender_get_texture(f->capture));
