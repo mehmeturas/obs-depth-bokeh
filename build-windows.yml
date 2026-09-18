@@ -1,0 +1,146 @@
+name: Build Windows Installer
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+env:
+  OBS_VERSION: '30.2.3'
+  ORT_VERSION: '1.18.0'
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      # ------------------------------------------------------------------
+      # libobs
+      #
+      # We build only the libobs target from the OBS source tree. The UI,
+      # bundled plugins and scripting are all switched off, which takes this
+      # from ~40 minutes down to ~12.
+      # ------------------------------------------------------------------
+      - name: Cache libobs build
+        id: cache-obs
+        uses: actions/cache@v4
+        with:
+          path: obs-studio/build
+          key: libobs-${{ env.OBS_VERSION }}-windows-x64-v2
+
+      - name: Check out OBS Studio
+        if: steps.cache-obs.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: obsproject/obs-studio
+          ref: ${{ env.OBS_VERSION }}
+          submodules: recursive
+          path: obs-studio
+
+      - name: Fetch OBS prebuilt dependencies
+        if: steps.cache-obs.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/obsproject/obs-deps/releases/download/2024-03-19/windows-deps-2024-03-19-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile deps.zip
+          Expand-Archive deps.zip -DestinationPath "$env:GITHUB_WORKSPACE/obs-deps"
+
+      - name: Build libobs
+        if: steps.cache-obs.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          cmake -S obs-studio -B obs-studio/build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE/obs-deps" `
+            -DENABLE_UI=OFF `
+            -DENABLE_SCRIPTING=OFF `
+            -DENABLE_PLUGINS=OFF `
+            -DENABLE_BROWSER=OFF `
+            -DENABLE_WEBSOCKET=OFF `
+            -DBUILD_TESTS=OFF
+          cmake --build obs-studio/build --config Release --target libobs
+
+      # ------------------------------------------------------------------
+      # ONNX Runtime (DirectML build, for GPU inference)
+      # ------------------------------------------------------------------
+      - name: Fetch ONNX Runtime
+        shell: pwsh
+        run: |
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ORT_VERSION }}/onnxruntime-win-x64-directml-${{ env.ORT_VERSION }}.zip"
+          Invoke-WebRequest -Uri $url -OutFile ort.zip
+          Expand-Archive ort.zip -DestinationPath ort-tmp
+          $inner = Get-ChildItem ort-tmp -Directory | Select-Object -First 1
+          Move-Item $inner.FullName "$env:GITHUB_WORKSPACE/onnxruntime"
+
+      # ------------------------------------------------------------------
+      # The depth model itself.
+      #
+      # ~100 MB. Bundling it means the user never has to hunt for a file,
+      # which is the single biggest usability win over the manual route.
+      # ------------------------------------------------------------------
+      - name: Fetch depth model
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path models | Out-Null
+          $url = "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx"
+          Invoke-WebRequest -Uri $url -OutFile "models/depth_anything_v2_small.onnx"
+
+      # ------------------------------------------------------------------
+      # The plugin
+      # ------------------------------------------------------------------
+      - name: Configure plugin
+        shell: pwsh
+        run: |
+          cmake -S plugin -B plugin/build -G "Visual Studio 17 2022" -A x64 `
+            -DONNXRUNTIME_ROOT="$env:GITHUB_WORKSPACE/onnxruntime" `
+            -Dlibobs_DIR="$env:GITHUB_WORKSPACE/obs-studio/build/libobs"
+
+      - name: Build plugin
+        run: cmake --build plugin/build --config Release
+
+      # ------------------------------------------------------------------
+      # Stage everything the installer needs in one predictable folder
+      # ------------------------------------------------------------------
+      - name: Stage payload
+        shell: pwsh
+        run: |
+          $stage = "$env:GITHUB_WORKSPACE/stage"
+          New-Item -ItemType Directory -Force -Path "$stage/bin" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage/data" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$stage/models" | Out-Null
+
+          Copy-Item "plugin/build/Release/obs-depth-bokeh.dll" "$stage/bin/"
+          Copy-Item "onnxruntime/lib/onnxruntime.dll" "$stage/bin/"
+          if (Test-Path "onnxruntime/lib/DirectML.dll") {
+            Copy-Item "onnxruntime/lib/DirectML.dll" "$stage/bin/"
+          }
+          Copy-Item "plugin/data/*" "$stage/data/" -Recurse
+          Copy-Item "models/depth_anything_v2_small.onnx" "$stage/models/"
+          Copy-Item "plugin/KURULUM.md" "$stage/"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "C:/Program Files (x86)/Inno Setup 6/ISCC.exe" `
+            /DStageDir="$env:GITHUB_WORKSPACE\stage" `
+            /DOutDir="$env:GITHUB_WORKSPACE\dist" `
+            "plugin/installer/installer.iss"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: obs-depth-bokeh-installer
+          path: dist/*.exe
+
+      # Tag a commit as v1.0.0 and the installer lands on the Releases page
+      # automatically, ready to hand to anyone.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe

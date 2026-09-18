@@ -1,0 +1,158 @@
+/*
+ * Depth-graded bokeh.
+ *
+ * Unlike a binary background blur, the blur radius here is a continuous
+ * function of the estimated depth, so a wall three metres behind you is
+ * blurred far harder than your own shoulder. That gradient is the thing that
+ * reads as "real lens" instead of "software cutout".
+ */
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d depth_map;
+
+uniform float2 texel;
+uniform float max_radius;
+uniform float focus_depth;
+uniform float focus_range;
+uniform float edge_sensitivity;
+uniform float mix_amount;
+
+sampler_state texSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+sampler_state depthSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+#define TAPS 40
+#define GOLDEN_ANGLE 2.39996323
+
+/* Circle of confusion in pixels. depth is 0 (far) .. 1 (near). */
+float coc_from_depth(float d)
+{
+	float dist = abs(d - focus_depth);
+	float t = saturate((dist - focus_range) / max(1e-4, 1.0 - focus_range));
+	/* Slight ease so the transition out of focus is not linear-looking. */
+	return t * t * max_radius;
+}
+
+/* The depth map is low resolution by design. Sampling it with a small
+ * cross and keeping the value nearest the centre pixel's own depth acts as a
+ * cheap joint-bilateral upsample: it snaps the mask back onto real image
+ * edges instead of letting it bleed across hair and glasses. */
+float sample_depth_guided(float2 uv, float ref)
+{
+	float d0 = depth_map.Sample(depthSampler, uv).r;
+	float2 s = texel * 1.5;
+
+	float d1 = depth_map.Sample(depthSampler, uv + float2( s.x, 0.0)).r;
+	float d2 = depth_map.Sample(depthSampler, uv + float2(-s.x, 0.0)).r;
+	float d3 = depth_map.Sample(depthSampler, uv + float2(0.0,  s.y)).r;
+	float d4 = depth_map.Sample(depthSampler, uv + float2(0.0, -s.y)).r;
+
+	float best = d0;
+	float bestd = abs(d0 - ref);
+
+	if (abs(d1 - ref) < bestd) { best = d1; bestd = abs(d1 - ref); }
+	if (abs(d2 - ref) < bestd) { best = d2; bestd = abs(d2 - ref); }
+	if (abs(d3 - ref) < bestd) { best = d3; bestd = abs(d3 - ref); }
+	if (abs(d4 - ref) < bestd) { best = d4; }
+
+	return best;
+}
+
+float4 PSBokeh(VertData v_in) : TARGET
+{
+	float4 center = image.Sample(texSampler, v_in.uv);
+	float dc = depth_map.Sample(depthSampler, v_in.uv).r;
+	dc = sample_depth_guided(v_in.uv, dc);
+
+	float coc_c = coc_from_depth(dc);
+
+	/* In focus: return untouched. Saves most of the GPU cost on the
+	 * subject, which is usually a large part of a webcam frame. */
+	if (coc_c < 0.6 || mix_amount < 0.001)
+		return center;
+
+	float3 acc = center.rgb;
+	float wsum = 1.0;
+
+	[loop]
+	for (int i = 1; i <= TAPS; i++) {
+		float t = float(i) / float(TAPS);
+		float r = sqrt(t) * coc_c;          /* uniform disk density */
+		float a = float(i) * GOLDEN_ANGLE;  /* spiral, no banding */
+
+		float2 uv = v_in.uv + float2(cos(a), sin(a)) * r * texel;
+
+		float ds = depth_map.Sample(depthSampler, uv).r;
+		float3 cs = image.Sample(texSampler, uv).rgb;
+
+		float coc_s = coc_from_depth(ds);
+
+		/* Reject samples that sit noticeably closer to the camera than
+		 * the pixel being shaded. Without this the subject smears
+		 * outward into the background and the halo gives the whole
+		 * effect away. */
+		float occl = 1.0 - saturate((ds - dc) * edge_sensitivity);
+
+		/* A sample only contributes if its own blur circle is wide
+		 * enough to actually reach this pixel. */
+		float w = saturate(coc_s / max(r, 1e-3)) * occl;
+
+		/* Bright points bloom into visible bokeh discs, as they do
+		 * optically. This is what makes background lights read as
+		 * real highlights rather than grey mush. */
+		float lum = dot(cs, float3(0.299, 0.587, 0.114));
+		w *= 1.0 + lum * lum * 0.75;
+
+		acc += cs * w;
+		wsum += w;
+	}
+
+	float3 blurred = acc / max(wsum, 1e-4);
+	return float4(lerp(center.rgb, blurred, mix_amount), center.a);
+}
+
+/* Debug view: shows what the model actually thinks the depth is. Invaluable
+ * when tuning focus / range, useless on stream. */
+float4 PSDepth(VertData v_in) : TARGET
+{
+	float d = depth_map.Sample(depthSampler, v_in.uv).r;
+	return float4(d, d, d, 1.0);
+}
+
+technique Draw
+{
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBokeh(v_in);
+	}
+}
+
+technique DrawDepth
+{
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDepth(v_in);
+	}
+}
