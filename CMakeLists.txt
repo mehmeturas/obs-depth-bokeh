@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 
 project(obs-depth-bokeh VERSION 1.0.0)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
@@ -35,6 +35,12 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
   "${ONNXRUNTIME_ROOT}/include"
+)
+# Windows headers define min/max as macros, which collide with
+# std::numeric_limits<>::max() and std::min/std::max in the engine.
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+  NOMINMAX
+  WIN32_LEAN_AND_MEAN
 )
 
 if(WIN32)
