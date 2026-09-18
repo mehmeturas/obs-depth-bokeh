@@ -1,176 +1,140 @@
-name: Build Windows Installer
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d depth_map;
 
-on:
-  push:
-    branches: [ main ]
-    tags: [ 'v*' ]
-  workflow_dispatch:
+uniform float2 texel;
+uniform float max_radius;
+uniform float focus_depth;
+uniform float focus_range;
+uniform float edge_sensitivity;
+uniform float mix_amount;
 
-env:
-  OBS_VERSION: '30.2.3'
-  ORT_VERSION: '1.18.0'
-  DML_VERSION: '1.14.1'
+sampler_state texSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
 
-jobs:
-  build:
-    runs-on: windows-2022
+sampler_state depthSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
 
-    steps:
-      - name: Check out plugin
-        uses: actions/checkout@v4
-        with:
-          path: plugin
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
 
-      # ------------------------------------------------------------------
-      # libobs
-      #
-      # We build only the libobs target from the OBS source tree. The UI,
-      # bundled plugins and scripting are all switched off, which takes this
-      # from ~40 minutes down to ~12.
-      # ------------------------------------------------------------------
-      - name: Cache libobs build
-        id: cache-obs
-        uses: actions/cache@v4
-        with:
-          path: obs-studio/build
-          key: libobs-${{ env.OBS_VERSION }}-windows-x64-v2
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
 
-      - name: Check out OBS Studio
-        if: steps.cache-obs.outputs.cache-hit != 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: obsproject/obs-studio
-          ref: ${{ env.OBS_VERSION }}
-          submodules: recursive
-          path: obs-studio
+float coc_from_depth(float d)
+{
+	float dist = abs(d - focus_depth);
+	float denom = 1.0 - focus_range;
+	if (denom < 0.0001)
+		denom = 0.0001;
+	float t = saturate((dist - focus_range) / denom);
+	return t * t * max_radius;
+}
 
-      - name: Fetch OBS prebuilt dependencies
-        if: steps.cache-obs.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $url = "https://github.com/obsproject/obs-deps/releases/download/2024-03-19/windows-deps-2024-03-19-x64.zip"
-          Invoke-WebRequest -Uri $url -OutFile deps.zip
-          Expand-Archive deps.zip -DestinationPath "$env:GITHUB_WORKSPACE/obs-deps"
+float sample_depth_guided(float2 uv, float ref)
+{
+	float d0 = depth_map.Sample(depthSampler, uv).r;
+	float2 s = texel * 1.5;
 
-      - name: Build libobs
-        if: steps.cache-obs.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          cmake -S obs-studio -B obs-studio/build -G "Visual Studio 17 2022" -A x64 `
-            -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE/obs-deps" `
-            -DENABLE_UI=OFF `
-            -DENABLE_SCRIPTING=OFF `
-            -DENABLE_PLUGINS=OFF `
-            -DENABLE_BROWSER=OFF `
-            -DENABLE_WEBSOCKET=OFF `
-            -DBUILD_TESTS=OFF
-          cmake --build obs-studio/build --config Release --target libobs
+	float d1 = depth_map.Sample(depthSampler, uv + float2( s.x, 0.0)).r;
+	float d2 = depth_map.Sample(depthSampler, uv + float2(-s.x, 0.0)).r;
+	float d3 = depth_map.Sample(depthSampler, uv + float2(0.0,  s.y)).r;
+	float d4 = depth_map.Sample(depthSampler, uv + float2(0.0, -s.y)).r;
 
-      # ------------------------------------------------------------------
-      # ONNX Runtime (DirectML build)
-      #
-      # The DirectML flavour is published on NuGet only - there is no
-      # matching zip on the GitHub releases page. A .nupkg is just a zip,
-      # so we rename and extract it, then reshape it into the include/ +
-      # lib/ layout the CMakeLists expects.
-      # ------------------------------------------------------------------
-      - name: Fetch ONNX Runtime
-        shell: pwsh
-        run: |
-          $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/${{ env.ORT_VERSION }}"
-          Invoke-WebRequest -Uri $url -OutFile ort.zip
-          Expand-Archive ort.zip -DestinationPath ort-nuget
+	float best = d0;
+	float bestd = abs(d0 - ref);
 
-          New-Item -ItemType Directory -Force -Path onnxruntime/include | Out-Null
-          New-Item -ItemType Directory -Force -Path onnxruntime/lib | Out-Null
+	if (abs(d1 - ref) < bestd) { best = d1; bestd = abs(d1 - ref); }
+	if (abs(d2 - ref) < bestd) { best = d2; bestd = abs(d2 - ref); }
+	if (abs(d3 - ref) < bestd) { best = d3; bestd = abs(d3 - ref); }
+	if (abs(d4 - ref) < bestd) { best = d4; }
 
-          Copy-Item "ort-nuget/build/native/include/*" "onnxruntime/include/" -Recurse -Force
-          Copy-Item "ort-nuget/runtimes/win-x64/native/*" "onnxruntime/lib/" -Force
+	return best;
+}
 
-          Write-Host "--- headers ---"
-          Get-ChildItem onnxruntime/include | Select-Object -ExpandProperty Name
-          Write-Host "--- libs ---"
-          Get-ChildItem onnxruntime/lib | Select-Object -ExpandProperty Name
+float4 PSBokeh(VertData v_in) : TARGET
+{
+	float4 center = image.Sample(texSampler, v_in.uv);
+	float dc = depth_map.Sample(depthSampler, v_in.uv).r;
+	dc = sample_depth_guided(v_in.uv, dc);
 
-      # DirectML.dll ships inbox on Windows 10 1903+, so this is belt and
-      # braces. A failure here must not fail the build.
-      - name: Fetch DirectML runtime
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          try {
-            $url = "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/${{ env.DML_VERSION }}"
-            Invoke-WebRequest -Uri $url -OutFile dml.zip
-            Expand-Archive dml.zip -DestinationPath dml-nuget
-            Copy-Item "dml-nuget/bin/x64-win/DirectML.dll" "onnxruntime/lib/" -Force
-          } catch {
-            Write-Host "DirectML package unavailable, relying on the system copy."
-          }
+	float coc_c = coc_from_depth(dc);
 
-      # ------------------------------------------------------------------
-      # The depth model itself.
-      #
-      # ~100 MB. Bundling it means the user never has to hunt for a file,
-      # which is the single biggest usability win over the manual route.
-      # ------------------------------------------------------------------
-      - name: Fetch depth model
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path models | Out-Null
-          $url = "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx"
-          Invoke-WebRequest -Uri $url -OutFile "models/depth_anything_v2_small.onnx"
+	if (coc_c < 0.6)
+		return center;
+	if (mix_amount < 0.001)
+		return center;
 
-      # ------------------------------------------------------------------
-      # The plugin
-      # ------------------------------------------------------------------
-      - name: Configure plugin
-        shell: pwsh
-        run: |
-          cmake -S plugin -B plugin/build -G "Visual Studio 17 2022" -A x64 `
-            -DONNXRUNTIME_ROOT="$env:GITHUB_WORKSPACE/onnxruntime" `
-            -Dlibobs_DIR="$env:GITHUB_WORKSPACE/obs-studio/build/libobs"
+	float3 acc = center.rgb;
+	float wsum = 1.0;
 
-      - name: Build plugin
-        run: cmake --build plugin/build --config Release
+	int i;
+	for (i = 1; i <= 40; i++) {
+		float t = (float)i / 40.0;
+		float r = sqrt(t) * coc_c;
+		float a = (float)i * 2.39996323;
 
-      # ------------------------------------------------------------------
-      # Stage everything the installer needs in one predictable folder
-      # ------------------------------------------------------------------
-      - name: Stage payload
-        shell: pwsh
-        run: |
-          $stage = "$env:GITHUB_WORKSPACE/stage"
-          New-Item -ItemType Directory -Force -Path "$stage/bin" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$stage/data" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$stage/models" | Out-Null
+		float2 uv = v_in.uv + float2(cos(a), sin(a)) * r * texel;
 
-          Copy-Item "plugin/build/Release/obs-depth-bokeh.dll" "$stage/bin/"
-          Copy-Item "onnxruntime/lib/onnxruntime.dll" "$stage/bin/"
-          if (Test-Path "onnxruntime/lib/DirectML.dll") {
-            Copy-Item "onnxruntime/lib/DirectML.dll" "$stage/bin/"
-          }
-          Copy-Item "plugin/data/*" "$stage/data/" -Recurse
-          Copy-Item "models/depth_anything_v2_small.onnx" "$stage/models/"
-          Copy-Item "plugin/KURULUM.md" "$stage/"
+		float ds = depth_map.Sample(depthSampler, uv).r;
+		float3 cs = image.Sample(texSampler, uv).rgb;
 
-      - name: Build installer
-        shell: pwsh
-        run: |
-          & "C:/Program Files (x86)/Inno Setup 6/ISCC.exe" `
-            /DStageDir="$env:GITHUB_WORKSPACE\stage" `
-            /DOutDir="$env:GITHUB_WORKSPACE\dist" `
-            "plugin/installer/installer.iss"
+		float coc_s = coc_from_depth(ds);
 
-      - name: Upload installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: obs-depth-bokeh-installer
-          path: dist/*.exe
+		float occl = 1.0 - saturate((ds - dc) * edge_sensitivity);
 
-      # Tag a commit as v1.0.0 and the installer lands on the Releases page
-      # automatically, ready to hand to anyone.
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*.exe
+		float rr = r;
+		if (rr < 0.001)
+			rr = 0.001;
+		float w = saturate(coc_s / rr) * occl;
+
+		float lum = dot(cs, float3(0.299, 0.587, 0.114));
+		w = w * (1.0 + lum * lum * 0.75);
+
+		acc = acc + cs * w;
+		wsum = wsum + w;
+	}
+
+	if (wsum < 0.0001)
+		wsum = 0.0001;
+
+	float3 blurred = acc / wsum;
+	return float4(lerp(center.rgb, blurred, mix_amount), center.a);
+}
+
+float4 PSDepth(VertData v_in) : TARGET
+{
+	float d = depth_map.Sample(depthSampler, v_in.uv).r;
+	return float4(d, d, d, 1.0);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBokeh(v_in);
+	}
+}
+
+technique DrawDepth
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSDepth(v_in);
+	}
+}
