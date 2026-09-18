@@ -111,11 +111,20 @@ jobs:
       - name: Configure plugin
         shell: pwsh
         run: |
+          # libobs exports find_dependency() calls for packages that live
+          # scattered through its own build tree, not in obs-deps. Rather
+          # than guessing each path, collect every folder in the tree that
+          # holds a CMake package config and hand CMake the whole list.
+          $paths = @("$env:GITHUB_WORKSPACE/obs-deps")
+          Get-ChildItem "$env:GITHUB_WORKSPACE/obs-studio/build" -Recurse -Filter "*onfig.cmake" -ErrorAction SilentlyContinue |
+            ForEach-Object { $paths += $_.Directory.FullName }
+          $prefix = ($paths | Select-Object -Unique) -join ";"
+          Write-Host "Prefix path: $prefix"
+
           cmake -S plugin -B plugin/build -G "Visual Studio 17 2022" -A x64 `
             -DONNXRUNTIME_ROOT="$env:GITHUB_WORKSPACE/onnxruntime" `
             -Dlibobs_DIR="$env:GITHUB_WORKSPACE/obs-studio/build/libobs" `
-            -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE/obs-deps"
-
+            -DCMAKE_PREFIX_PATH="$prefix"
       - name: Build plugin
         run: cmake --build plugin/build --config Release
 
