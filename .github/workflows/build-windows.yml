@@ -71,11 +71,12 @@ jobs:
       - name: Fetch ONNX Runtime
         shell: pwsh
         run: |
-          $url = "https://github.com/microsoft/onnxruntime/releases/download/v${{ env.ORT_VERSION }}/onnxruntime-win-x64-directml-${{ env.ORT_VERSION }}.zip"
-          Invoke-WebRequest -Uri $url -OutFile ort.zip
-          Expand-Archive ort.zip -DestinationPath ort-tmp
-          $inner = Get-ChildItem ort-tmp -Directory | Select-Object -First 1
-          Move-Item $inner.FullName "$env:GITHUB_WORKSPACE/onnxruntime"
+            $url = "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/${{ env.ORT_VERSION }}"
+            Invoke-WebRequest -Uri $url -OutFile ort.zip
+            Expand-Archive ort.zip -DestinationPath ort-nuget
+            New-Item -ItemType Directory -Force -Path onnxruntime/include, onnxruntime/lib | Out-Null
+            Copy-Item "ort-nuget/build/native/include/*" "onnxruntime/include/" -Recurse -Force
+            Copy-Item "ort-nuget/runtimes/win-x64/native/*" "onnxruntime/lib/" -Force
 
       # ------------------------------------------------------------------
       # The depth model itself.
